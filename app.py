@@ -4,8 +4,9 @@ import numpy as np
 import mediapipe as mp
 import pickle
 from tensorflow.keras.models import load_model
-from PIL import Image
-import io
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+import av
+from collections import deque
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -47,17 +48,14 @@ st.markdown(
         color: #FF9800;
         font-weight: bold;
     }
-    .stButton>button {
-        width: 100%;
-        background-color: #1E88E5;
-        color: white;
-        font-size: 1.2rem;
-        padding: 0.5rem;
-        border-radius: 10px;
-    }
     </style>
 """,
     unsafe_allow_html=True,
+)
+
+# RTC Configuration for WebRTC
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
 
 
@@ -75,18 +73,6 @@ def load_asl_model(model_path, classes_path):
         return None, None
 
 
-# --- Initialize MediaPipe ---
-def get_mediapipe_hands():
-    """Get a fresh MediaPipe Hands instance"""
-    mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(
-        static_image_mode=True,
-        max_num_hands=1,
-        min_detection_confidence=0.7,
-    )
-    return mp_hands, hands
-
-
 # --- Extract Landmarks ---
 def extract_landmarks_from_frame(hand_landmarks):
     """Extract 63 features from detected hand"""
@@ -96,38 +82,67 @@ def extract_landmarks_from_frame(hand_landmarks):
     return np.array(coords)
 
 
-# --- Process Single Image ---
-def process_image(image, model, class_names):
-    """Process a single image and return predictions"""
-    # Initialize MediaPipe for this image
-    mp_hands, hands = get_mediapipe_hands()
-    mp_drawing = mp.solutions.drawing_utils
-    
-    try:
-        # Convert PIL to numpy array if needed
-        if isinstance(image, Image.Image):
-            image = np.array(image)
+# --- Video Processor Class ---
+class ASLVideoProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.model = None
+        self.class_names = None
+        self.mp_hands = mp.solutions.hands
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.hands = self.mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.5,
+        )
+        self.prediction_history = deque(maxlen=5)
+        self.current_prediction = "NOTHING"
+        self.current_confidence = 0.0
+        self.top3_predictions = []
+
+    def set_model(self, model, class_names):
+        """Set the model and class names"""
+        self.model = model
+        self.class_names = class_names
+
+    def recv(self, frame):
+        """Process each frame from the webcam"""
+        img = frame.to_ndarray(format="bgr24")
         
-        # Make a copy for drawing
-        output_image = image.copy()
+        if self.model is None:
+            # Display "Load Model First" message
+            cv2.putText(
+                img,
+                "Load Model First!",
+                (50, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.2,
+                (0, 0, 255),
+                3,
+            )
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+        # Flip for mirror effect
+        img = cv2.flip(img, 1)
         
         # Convert to RGB for MediaPipe
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        results = hands.process(image_rgb)
+        image_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        results = self.hands.process(image_rgb)
 
         predicted_class = "NOTHING"
         confidence = 0.0
-        top3_predictions = []
 
         if results.multi_hand_landmarks:
             for hand_landmarks in results.multi_hand_landmarks:
                 # Draw hand landmarks
-                mp_drawing.draw_landmarks(
-                    output_image,
+                self.mp_drawing.draw_landmarks(
+                    img,
                     hand_landmarks,
-                    mp_hands.HAND_CONNECTIONS,
-                    mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
-                    mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=2),
+                    self.mp_hands.HAND_CONNECTIONS,
+                    self.mp_drawing.DrawingSpec(
+                        color=(0, 255, 0), thickness=2, circle_radius=2
+                    ),
+                    self.mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=2),
                 )
 
                 # Extract landmarks for prediction
@@ -135,42 +150,72 @@ def process_image(image, model, class_names):
                 landmarks = landmarks.reshape(1, -1)
 
                 # Predict
-                predictions = model.predict(landmarks, verbose=0)
+                predictions = self.model.predict(landmarks, verbose=0)
                 predicted_idx = np.argmax(predictions[0])
                 confidence = predictions[0][predicted_idx]
-                predicted_class = class_names[predicted_idx]
+
+                # Smooth predictions
+                self.prediction_history.append(predicted_idx)
+                
+                # Use most common prediction
+                if len(self.prediction_history) > 0:
+                    final_prediction = max(
+                        set(self.prediction_history), key=list(self.prediction_history).count
+                    )
+                    predicted_class = self.class_names[final_prediction]
 
                 # Get top 3 predictions
                 top3_indices = np.argsort(predictions[0])[-3:][::-1]
-                top3_predictions = [
-                    (class_names[idx], predictions[0][idx]) for idx in top3_indices
+                self.top3_predictions = [
+                    (self.class_names[idx], predictions[0][idx]) for idx in top3_indices
                 ]
 
-                # Display prediction on image
+                # Update current prediction
+                self.current_prediction = predicted_class
+                self.current_confidence = confidence
+
+                # Display prediction on frame
                 text = f"{predicted_class}: {confidence*100:.1f}%"
+                text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)[0]
+                
+                # Background rectangle
+                cv2.rectangle(
+                    img, (10, 10), (20 + text_size[0], 60), (0, 0, 0), -1
+                )
+
+                # Text color based on confidence
                 color = (0, 255, 0) if confidence > 0.7 else (0, 255, 255)
-                cv2.putText(output_image, text, (15, 50), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3)
+                cv2.putText(
+                    img, text, (15, 45), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3
+                )
         else:
             # No hand detected
-            cv2.putText(output_image, "No hand detected", (15, 50),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+            cv2.putText(
+                img,
+                "Show your hand",
+                (15, 45),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.2,
+                (0, 255, 255),
+                3,
+            )
+            self.prediction_history.clear()
+            self.current_prediction = "NOTHING"
+            self.current_confidence = 0.0
+            self.top3_predictions = []
 
-        return output_image, predicted_class, confidence, top3_predictions
-    
-    finally:
-        # Always close hands properly
-        hands.close()
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
 # --- Main App ---
 def main():
     # Header
     st.markdown(
-        '<p class="main-header">🤟 ASL Recognition System</p>', unsafe_allow_html=True
+        '<p class="main-header">🤟 Real-Time ASL Recognition</p>',
+        unsafe_allow_html=True,
     )
     st.markdown(
-        '<p class="sub-header">Real-time American Sign Language Recognition using AI</p>',
+        '<p class="sub-header">Live American Sign Language Recognition using AI</p>',
         unsafe_allow_html=True,
     )
 
@@ -192,19 +237,34 @@ def main():
             help="Path to the classes pickle file",
         )
 
+        # Load model button
+        load_model_btn = st.button("🔄 Load Model", use_container_width=True)
+
         st.markdown("---")
         st.markdown("### 📖 Instructions")
         st.markdown(
             """
-        1. Load the model using the button below
-        2. Use your camera or upload an image
-        3. Show ASL hand signs
-        4. View predictions in real-time
+        1. Click **Load Model** above
+        2. Click **START** on the video
+        3. Allow camera access in your browser
+        4. Show ASL hand signs to the camera
+        5. View real-time predictions below
         """
         )
 
-    # Load model button
-    if st.sidebar.button("🔄 Load Model", use_container_width=True):
+        st.markdown("---")
+        st.info("💡 **Tip:** Make sure your hand is clearly visible and well-lit!")
+
+    # Initialize session state
+    if "model_loaded" not in st.session_state:
+        st.session_state.model_loaded = False
+    if "model" not in st.session_state:
+        st.session_state.model = None
+    if "class_names" not in st.session_state:
+        st.session_state.class_names = None
+
+    # Load model
+    if load_model_btn:
         with st.spinner("Loading model..."):
             model, class_names = load_asl_model(model_path, classes_path)
             if model is not None:
@@ -213,114 +273,69 @@ def main():
                 st.session_state.model_loaded = True
                 st.sidebar.success(f"✅ Model loaded! Classes: {len(class_names)}")
             else:
-                st.sidebar.error("❌ Failed to load model.")
-
-    # Initialize session state
-    if "model_loaded" not in st.session_state:
-        st.session_state.model_loaded = False
+                st.sidebar.error("❌ Failed to load model. Check the file paths.")
 
     # Main content
-    if not st.session_state.model_loaded:
-        st.warning("⚠️ Please load the model first using the sidebar.")
-        return
+    col1, col2 = st.columns([2, 1])
 
-    # Create tabs for different input methods
-    tab1, tab2 = st.tabs(["📸 Camera Input", "📤 Upload Image"])
-
-    with tab1:
-        st.subheader("📸 Use Your Camera")
-        st.info("👉 Take a photo showing an ASL hand sign")
+    with col1:
+        st.subheader("📹 Live Camera Feed")
         
-        camera_photo = st.camera_input("Take a picture")
-        
-        if camera_photo is not None:
-            # Read image
-            image = Image.open(camera_photo)
-            image_np = np.array(image)
-            
-            # Process image
-            with st.spinner("Processing..."):
-                output_image, predicted_class, confidence, top3_predictions = process_image(
-                    image_np,
-                    st.session_state.model,
-                    st.session_state.class_names
-                )
-            
-            # Display results
-            col1, col2 = st.columns([2, 1])
-            
-            with col1:
-                st.image(output_image, caption="Processed Image", use_column_width=True)
-            
-            with col2:
-                if predicted_class != "NOTHING":
-                    conf_class = "confidence-high" if confidence > 0.7 else "confidence-low"
-                    st.markdown(
-                        f"""
-                        <div class="prediction-box">
-                            <h2 style="margin:0; color: #1E88E5;">🤟 {predicted_class}</h2>
-                            <p style="font-size: 1.5rem; margin:10px 0 0 0;" class="{conf_class}">
-                                Confidence: {confidence*100:.1f}%
-                            </p>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-                    
-                    if top3_predictions:
-                        st.markdown("**Top 3 Predictions:**")
-                        for i, (label, conf) in enumerate(top3_predictions, 1):
-                            st.write(f"{i}. **{label}**: {conf*100:.1f}%")
-                else:
-                    st.info("👋 No hand detected - Try again!")
-
-    with tab2:
-        st.subheader("📤 Upload an Image")
-        uploaded_file = st.file_uploader(
-            "Choose an image with an ASL hand sign",
-            type=["jpg", "jpeg", "png"]
+        # Create video processor
+        ctx = webrtc_streamer(
+            key="asl-recognition",
+            video_processor_factory=ASLVideoProcessor,
+            rtc_configuration=RTC_CONFIGURATION,
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
         )
+
+        # Set model in processor if loaded
+        if st.session_state.model_loaded and ctx.video_processor:
+            ctx.video_processor.set_model(
+                st.session_state.model, st.session_state.class_names
+            )
+
+    with col2:
+        st.subheader("📊 Live Predictions")
         
-        if uploaded_file is not None:
-            # Read image
-            image = Image.open(uploaded_file)
-            image_np = np.array(image)
+        if not st.session_state.model_loaded:
+            st.warning("⚠️ Please load the model first!")
+        else:
+            # Placeholder for predictions
+            prediction_placeholder = st.empty()
+            top3_placeholder = st.empty()
             
-            # Process image
-            with st.spinner("Processing..."):
-                output_image, predicted_class, confidence, top3_predictions = process_image(
-                    image_np,
-                    st.session_state.model,
-                    st.session_state.class_names
-                )
-            
-            # Display results
-            col1, col2 = st.columns([2, 1])
-            
-            with col1:
-                st.image(output_image, caption="Processed Image", use_column_width=True)
-            
-            with col2:
-                if predicted_class != "NOTHING":
-                    conf_class = "confidence-high" if confidence > 0.7 else "confidence-low"
-                    st.markdown(
+            # Display predictions from processor
+            if ctx.video_processor:
+                if ctx.video_processor.current_prediction != "NOTHING":
+                    conf_class = (
+                        "confidence-high"
+                        if ctx.video_processor.current_confidence > 0.7
+                        else "confidence-low"
+                    )
+                    prediction_placeholder.markdown(
                         f"""
                         <div class="prediction-box">
-                            <h2 style="margin:0; color: #1E88E5;">🤟 {predicted_class}</h2>
+                            <h2 style="margin:0; color: #1E88E5;">🤟 {ctx.video_processor.current_prediction}</h2>
                             <p style="font-size: 1.5rem; margin:10px 0 0 0;" class="{conf_class}">
-                                Confidence: {confidence*100:.1f}%
+                                Confidence: {ctx.video_processor.current_confidence*100:.1f}%
                             </p>
                         </div>
                         """,
                         unsafe_allow_html=True,
                     )
                     
-                    if top3_predictions:
-                        st.markdown("**Top 3 Predictions:**")
-                        for i, (label, conf) in enumerate(top3_predictions, 1):
-                            st.write(f"{i}. **{label}**: {conf*100:.1f}%")
+                    # Show top 3 predictions
+                    if ctx.video_processor.top3_predictions:
+                        with top3_placeholder.container():
+                            st.markdown("**Top 3 Predictions:**")
+                            for i, (label, conf) in enumerate(
+                                ctx.video_processor.top3_predictions, 1
+                            ):
+                                st.write(f"{i}. **{label}**: {conf*100:.1f}%")
                 else:
-                    st.info("👋 No hand detected - Try uploading another image!")
+                    prediction_placeholder.info("👋 Show a hand sign to start!")
 
 
 if __name__ == "__main__":
