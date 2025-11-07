@@ -6,6 +6,3 @@ tensorflow==2.19.1
 tqdm==4.66.4
 scikit-learn==1.5.2
 matplotlib==3.9.2
-
-
-
