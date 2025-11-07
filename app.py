@@ -323,6 +323,12 @@ def main():
 
         # Open camera
         cap = cv2.VideoCapture(camera_index)
+        if not cap.isOpened():
+            st.error("❌ Could not open camera. This usually happens on Streamlit Cloud (no webcam available).")
+            st.info("💡 Tip: Run locally with a webcam, or upload an image instead.")
+            st.session_state.camera_running = False
+            return
+
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
@@ -403,10 +409,15 @@ def main():
             if not st.session_state.camera_running:
                 break
 
-        # Release camera
-        cap.release()
-        hands.close()
+        # Release resources safely
+        if cap.isOpened():
+            cap.release()
+        try:
+            hands.close()
+        except ValueError:
+            pass
         status_placeholder.info("📷 Camera stopped")
+
 
 
 if __name__ == "__main__":
