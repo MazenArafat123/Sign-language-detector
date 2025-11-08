@@ -1,83 +1,114 @@
+import os
+import warnings
+import logging
+import sys
+
+# Suppress ALL warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+warnings.filterwarnings('ignore')
+logging.getLogger('tensorflow').setLevel(logging.ERROR)
+logging.getLogger('streamlit').setLevel(logging.ERROR)
+
+try:
+    import absl.logging
+    absl.logging.set_verbosity(absl.logging.ERROR)
+except ImportError:
+    pass
+
 import streamlit as st
 import cv2
 import numpy as np
 import mediapipe as mp
 import pickle
-from tensorflow.keras.models import load_model  # type: ignore
+from tensorflow.keras.models import load_model
 import time
 from PIL import Image
 
-# --- Page Configuration ---
+# ============ CONFIGURATION - UPDATE THESE PATHS ============
+MODEL_PATH = r"Models/asl_landmarks_final.h5"
+CLASSES_PATH = r"Models/asl_landmarks_classes.pkl"
+# ============================================================
+
+# Page configuration
 st.set_page_config(
-    page_title="ASL Recognition System",
+    page_title="ASL Word Builder",
     page_icon="🤟",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="expanded"
 )
 
-# --- Custom CSS ---
-st.markdown(
-    """
-    <style>
+# Custom CSS
+st.markdown("""
+<style>
     .main-header {
         font-size: 3rem;
-        font-weight: bold;
         color: #1E88E5;
         text-align: center;
         margin-bottom: 1rem;
     }
-    .sub-header {
-        font-size: 1.5rem;
-        color: #424242;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .prediction-box {
-        background-color: #E3F2FD;
+    .word-display {
+        font-size: 2.5rem;
+        color: #00FF00;
+        background-color: #000000;
         padding: 20px;
         border-radius: 10px;
-        border-left: 5px solid #1E88E5;
-        margin: 10px 0;
+        text-align: center;
+        font-family: monospace;
     }
-    .confidence-high {
-        color: #4CAF50;
-        font-weight: bold;
-    }
-    .confidence-low {
-        color: #FF9800;
-        font-weight: bold;
-    }
-    .stButton>button {
-        width: 100%;
-        background-color: #1E88E5;
-        color: white;
-        font-size: 1.2rem;
-        padding: 0.5rem;
+    .prediction-box {
+        font-size: 1.8rem;
+        padding: 15px;
         border-radius: 10px;
+        text-align: center;
+        font-weight: bold;
     }
-    </style>
-""",
-    unsafe_allow_html=True,
-)
+    .instruction-box {
+        background-color: black;
+        padding: 15px;
+        border-radius: 10px;
+        border-left: 5px solid #1E88E5;
+    }
+</style>
+""", unsafe_allow_html=True)
 
+# Initialize session state
+if 'current_word' not in st.session_state:
+    st.session_state.current_word = ""
+if 'word_history' not in st.session_state:
+    st.session_state.word_history = []
+if 'last_stable_letter' not in st.session_state:
+    st.session_state.last_stable_letter = None
+if 'stable_letter_start_time' not in st.session_state:
+    st.session_state.stable_letter_start_time = None
+if 'last_added_time' not in st.session_state:
+    st.session_state.last_added_time = 0
+if 'prediction_history' not in st.session_state:
+    st.session_state.prediction_history = []
+if 'camera_running' not in st.session_state:
+    st.session_state.camera_running = False
 
-# --- Load Model Function ---
 @st.cache_resource
-def load_asl_model(model_path, classes_path):
-    """Load the trained model and class names"""
+def load_asl_model():
+    """Load the trained model and class names from fixed paths"""
     try:
-        model = load_model(model_path)
-        with open(classes_path, "rb") as f:
+        if not os.path.exists(MODEL_PATH):
+            st.error(f"❌ Model file not found at: {MODEL_PATH}")
+            return None, None
+        
+        if not os.path.exists(CLASSES_PATH):
+            st.error(f"❌ Classes file not found at: {CLASSES_PATH}")
+            return None, None
+        
+        model = load_model(MODEL_PATH)
+        with open(CLASSES_PATH, 'rb') as f:
             class_names = pickle.load(f)
         return model, class_names
     except Exception as e:
-        st.error(f"Error loading model: {str(e)}")
+        st.error(f"❌ Error loading model: {e}")
         return None, None
 
-
-# --- Initialize MediaPipe ---
 @st.cache_resource
-def init_mediapipe():
+def initialize_mediapipe():
     """Initialize MediaPipe Hands"""
     mp_hands = mp.solutions.hands
     mp_drawing = mp.solutions.drawing_utils
@@ -85,12 +116,10 @@ def init_mediapipe():
         static_image_mode=False,
         max_num_hands=1,
         min_detection_confidence=0.7,
-        min_tracking_confidence=0.5,
+        min_tracking_confidence=0.5
     )
     return mp_hands, mp_drawing, hands
 
-
-# --- Extract Landmarks ---
 def extract_landmarks_from_frame(hand_landmarks):
     """Extract 63 features from detected hand"""
     coords = []
@@ -98,316 +127,239 @@ def extract_landmarks_from_frame(hand_landmarks):
         coords.extend([lm.x, lm.y, lm.z])
     return np.array(coords)
 
-
-# --- Process Frame ---
-def process_frame(
-    frame,
-    hands,
-    model,
-    class_names,
-    mp_hands,
-    mp_drawing,
-    prediction_history,
-    history_size=5,
-):
-    """Process a single frame and return predictions"""
-    # Flip for mirror effect
-    frame = cv2.flip(frame, 1)
-    h, w, c = frame.shape
-
-    # Convert to RGB for MediaPipe
+def process_frame(frame, model, class_names, hands, mp_hands, mp_drawing, 
+                 confirmation_threshold=2.0, cooldown_duration=0.5, history_size=5):
+    """Process a single frame and return prediction"""
+    
+    # Convert to RGB
     image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(image_rgb)
-
-    predicted_class = "NOTHING"
-    confidence = 0.0
-    top3_predictions = []
-
+    
+    current_time = time.time()
+    predicted_class = None
+    confidence = 0
+    time_held = 0
+    
     if results.multi_hand_landmarks:
         for hand_landmarks in results.multi_hand_landmarks:
             # Draw hand landmarks
             mp_drawing.draw_landmarks(
-                frame,
-                hand_landmarks,
+                frame, 
+                hand_landmarks, 
                 mp_hands.HAND_CONNECTIONS,
-                mp_drawing.DrawingSpec(
-                    color=(0, 255, 0), thickness=2, circle_radius=2),
-                mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=2),
+                mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
+                mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=2)
             )
-
+            
             # Extract landmarks for prediction
             landmarks = extract_landmarks_from_frame(hand_landmarks)
             landmarks = landmarks.reshape(1, -1)
-
+            
             # Predict
             predictions = model.predict(landmarks, verbose=0)
             predicted_idx = np.argmax(predictions[0])
             confidence = predictions[0][predicted_idx]
-
+            
             # Smooth predictions
-            prediction_history.append(predicted_idx)
-            if len(prediction_history) > history_size:
-                prediction_history.pop(0)
-
+            st.session_state.prediction_history.append(predicted_idx)
+            if len(st.session_state.prediction_history) > history_size:
+                st.session_state.prediction_history.pop(0)
+            
             # Use most common prediction
-            final_prediction = max(
-                set(prediction_history), key=prediction_history.count
-            )
+            final_prediction = max(set(st.session_state.prediction_history), 
+                                 key=st.session_state.prediction_history.count)
             predicted_class = class_names[final_prediction]
-
-            # Get top 3 predictions
-            top3_indices = np.argsort(predictions[0])[-3:][::-1]
-            top3_predictions = [
-                (class_names[idx], predictions[0][idx]) for idx in top3_indices
-            ]
-
-            # Display prediction on frame
-            text = f"{predicted_class}: {confidence*100:.1f}%"
-            text_size = cv2.getTextSize(
-                text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)[0]
-            cv2.rectangle(frame, (10, 10),
-                          (20 + text_size[0], 60), (0, 0, 0), -1)
-
-            color = (0, 255, 0) if confidence > 0.7 else (0, 255, 255)
-            cv2.putText(frame, text, (15, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3)
+            
+            # Letter confirmation logic
+            if confidence > 0.7:
+                if predicted_class == st.session_state.last_stable_letter:
+                    time_held = current_time - st.session_state.stable_letter_start_time
+                    
+                    if time_held >= confirmation_threshold and \
+                       (current_time - st.session_state.last_added_time) > cooldown_duration:
+                        
+                        if predicted_class.upper() == "SPACE":
+                            st.session_state.current_word += " "
+                            st.session_state.last_added_time = current_time
+                            st.session_state.stable_letter_start_time = current_time
+                        elif predicted_class.upper() == "DEL":
+                            if st.session_state.current_word:
+                                st.session_state.current_word = st.session_state.current_word[:-1]
+                                st.session_state.last_added_time = current_time
+                                st.session_state.stable_letter_start_time = current_time
+                        elif predicted_class.upper() not in ["NOTHING", "DELETE", "BACKSPACE"]:
+                            st.session_state.current_word += predicted_class.lower()
+                            st.session_state.last_added_time = current_time
+                            st.session_state.stable_letter_start_time = current_time
+                else:
+                    st.session_state.last_stable_letter = predicted_class
+                    st.session_state.stable_letter_start_time = current_time
+            
+            if st.session_state.last_stable_letter == predicted_class and confidence > 0.7:
+                time_held = current_time - st.session_state.stable_letter_start_time
     else:
-        # No hand detected
-        cv2.putText(
-            frame, "NOTHING", (15,
-                               50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 3
-        )
-        cv2.putText(
-            frame,
-            "No hand detected",
-            (15, 100),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
-            2,
-        )
-        prediction_history.clear()
+        predicted_class = "NOTHING"
+        st.session_state.prediction_history.clear()
+        st.session_state.last_stable_letter = None
+    
+    return frame, predicted_class, confidence, time_held
 
-    return frame, predicted_class, confidence, top3_predictions
+# Main content
+st.markdown('<h1 class="main-header">🤟 ASL Word Builder</h1>', unsafe_allow_html=True)
 
+# Load model automatically
+with st.spinner("Loading ASL model..."):
+    model, class_names = load_asl_model()
 
-# --- Main App ---
-def main():
-    # Header
-    st.markdown(
-        '<p class="main-header">🤟 ASL Recognition System</p>', unsafe_allow_html=True
-    )
-    st.markdown(
-        '<p class="sub-header">Real-time American Sign Language Recognition using AI</p>',
-        unsafe_allow_html=True,
-    )
+if model is not None and class_names is not None:
 
-    # Sidebar
+    # Initialize MediaPipe
+    mp_hands, mp_drawing, hands = initialize_mediapipe()
+    
+    # Sidebar for settings
     with st.sidebar:
-        st.header("⚙️ Settings")
-
-        # Model paths
-        st.subheader("📁 Model Configuration")
-        model_path = st.text_input(
-            "Model Path",
-            value=r"models/asl_landmarks_final.h5",
-            help="Path to the trained .h5 model file",
-        )
-
-        classes_path = st.text_input(
-            "Classes Path",
-            value=r"models/asl_landmarks_classes.pkl",
-            help="Path to the classes pickle file",
-        )
-
-        # Camera settings
-        st.subheader("📹 Camera Settings")
-        camera_index = st.number_input(
-            "Camera Index", min_value=0, max_value=5, value=0
-        )
-
-        # Detection settings
-        st.subheader("🎯 Detection Settings")
-        min_detection_confidence = st.slider(
-            "Min Detection Confidence",
-            min_value=0.1,
-            max_value=1.0,
-            value=0.7,
-            step=0.1,
-        )
-
-        history_size = st.slider(
-            "Prediction Smoothing",
-            min_value=1,
-            max_value=10,
-            value=5,
-            help="Number of frames to smooth predictions",
-        )
-
-        st.markdown("---")
-        st.markdown("### 📖 Instructions")
-        st.markdown(
-            """
-        1. Load the model using the button below
-        2. Click **Start Camera** to begin
-        3. Show ASL hand signs to the camera
-        4. View real-time predictions
-        5. Click **Stop Camera** when done
-        """
-        )
-
-    # Main content
+        st.image("https://img.icons8.com/color/96/000000/sign-language.png", width=100)
+        st.title("⚙️ Settings")
+        
+        st.info(f"📁 **Model:** Loaded\n\n📊 **Classes:** {len(class_names)}")
+        
+        st.divider()
+        
+        # Parameters
+        st.subheader("🎛️ Parameters")
+        confirmation_threshold = st.slider("Hold Time (seconds)", 0.5, 5.0, 2.0, 0.5)
+        cooldown_duration = st.slider("Cooldown (seconds)", 0.1, 2.0, 0.5, 0.1)
+        
+        st.divider()
+        
+        # Camera selection
+        camera_index = st.number_input("Camera Index", 0, 10, 0)       
+    
+    # Create columns for layout
     col1, col2 = st.columns([2, 1])
-
+    
     with col1:
-        st.subheader("📹 Live Camera Feed")
+        st.subheader("📹 Camera Feed")
         video_placeholder = st.empty()
-        status_placeholder = st.empty()
-
+        
     with col2:
-        st.subheader("📊 Predictions")
+        st.subheader("📊 Prediction")
         prediction_placeholder = st.empty()
-        top3_placeholder = st.empty()
-        stats_placeholder = st.empty()
-
-    # Control buttons
-    col_btn1, col_btn2, col_btn3 = st.columns(3)
-
-    with col_btn1:
-        load_model_btn = st.button("🔄 Load Model", use_container_width=True)
-
-    with col_btn2:
-        start_btn = st.button("▶️ Start Camera", use_container_width=True)
-
-    with col_btn3:
-        stop_btn = st.button("⏹️ Stop Camera", use_container_width=True)
-
-    # Initialize session state
-    if "model_loaded" not in st.session_state:
-        st.session_state.model_loaded = False
-    if "camera_running" not in st.session_state:
+        confidence_placeholder = st.empty()
+        progress_placeholder = st.empty()
+        
+        st.subheader("📝 Current Word")
+        word_placeholder = st.empty()
+        
+        # Action buttons
+        st.subheader("🎮 Actions")
+        if st.button("💾 Save", use_container_width=True):
+            if st.session_state.current_word.strip():
+                st.session_state.word_history.append(st.session_state.current_word.strip())
+                st.success(f"Saved: '{st.session_state.current_word.strip()}'")
+                st.session_state.current_word = ""
+                st.rerun()
+  
+        st.subheader("📜 Word History")
+        history_placeholder = st.empty()
+    
+    # Instructions
+    with st.expander("📖 Instructions", expanded=True):
+        st.markdown("""
+        <div class="instruction-box">
+        <h4>How to Use:</h4>
+        <ul>
+            <li>🤚 Hold your hand in front of the camera</li>
+            <li>✋ Make an ASL letter sign</li>
+            <li>⏱️ Hold the sign for 2 seconds to add it to the word</li>
+            <li>🔤 Special gestures: SPACE (add space), DEL (delete last character)</li>
+            <li>💾 Click "Save" to add the word to history</li>
+            <li>🗑️ Click "Clear" to start a new word</li>
+        </ul>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # Camera controls
+    col_start, col_stop = st.columns(2)
+    with col_start:
+        start_button = st.button("▶️ Start Camera", use_container_width=True, type="primary")
+    with col_stop:
+        stop_button = st.button("⏹️ Stop Camera", use_container_width=True)
+    
+    if start_button:
+        st.session_state.camera_running = True
+    if stop_button:
         st.session_state.camera_running = False
-    if "prediction_history" not in st.session_state:
-        st.session_state.prediction_history = []
-
-    # Load model
-    if load_model_btn:
-        with st.spinner("Loading model..."):
-            model, class_names = load_asl_model(model_path, classes_path)
-            if model is not None:
-                st.session_state.model = model
-                st.session_state.class_names = class_names
-                st.session_state.model_loaded = True
-                st.success(
-                    f"✅ Model loaded successfully! Classes: {len(class_names)}")
-            else:
-                st.error("❌ Failed to load model. Check the file paths.")
-
-    # Start camera
-    if start_btn:
-        if not st.session_state.model_loaded:
-            st.error("⚠️ Please load the model first!")
-        else:
-            st.session_state.camera_running = True
-
-    # Stop camera
-    if stop_btn:
-        st.session_state.camera_running = False
-        st.session_state.prediction_history = []
-        status_placeholder.info("📷 Camera stopped")
-
-    # Camera loop
-    if st.session_state.camera_running and st.session_state.model_loaded:
-        # Initialize MediaPipe
-        mp_hands, mp_drawing, hands = init_mediapipe()
-
-        # Open camera
+    
+    # Run camera
+    if st.session_state.camera_running:
         cap = cv2.VideoCapture(camera_index)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-        status_placeholder.success("🎥 Camera is running...")
-
-        frame_count = 0
-        start_time = time.time()
-
+        
         while st.session_state.camera_running:
             ret, frame = cap.read()
             if not ret:
-                status_placeholder.error("❌ Failed to grab frame")
+                st.error("Failed to capture frame")
                 break
-
+            
+            frame = cv2.flip(frame, 1)
+            
             # Process frame
-            processed_frame, predicted_class, confidence, top3_predictions = (
-                process_frame(
-                    frame,
-                    hands,
-                    st.session_state.model,
-                    st.session_state.class_names,
-                    mp_hands,
-                    mp_drawing,
-                    st.session_state.prediction_history,
-                    history_size,
+            processed_frame, predicted_class, confidence, time_held = process_frame(
+                frame, model, class_names, hands, mp_hands, mp_drawing,
+                confirmation_threshold, cooldown_duration
+            )
+            
+            # Display video
+            frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+            video_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
+            
+            # Display prediction
+            if predicted_class:
+                color = "green" if confidence > 0.7 else "orange"
+                prediction_placeholder.markdown(
+                    f'<div class="prediction-box" style="background-color: {color}; color: white;">'
+                    f'{predicted_class}'
+                    f'</div>',
+                    unsafe_allow_html=True
                 )
-            )
-
-            # Convert BGR to RGB for display
-            processed_frame_rgb = cv2.cvtColor(
-                processed_frame, cv2.COLOR_BGR2RGB)
-            video_placeholder.image(
-                processed_frame_rgb, channels="RGB", use_column_width=True
-            )
-
-            # Update predictions
-            with prediction_placeholder.container():
-                if predicted_class != "NOTHING":
-                    conf_class = (
-                        "confidence-high" if confidence > 0.7 else "confidence-low"
-                    )
-                    st.markdown(
-                        f"""
-                    <div class="prediction-box">
-                        <h2 style="margin:0; color: #1E88E5;">🤟 {predicted_class}</h2>
-                        <p style="font-size: 1.5rem; margin:10px 0 0 0;" class="{conf_class}">
-                            Confidence: {confidence*100:.1f}%
-                        </p>
-                    </div>
-                    """,
-                        unsafe_allow_html=True,
-                    )
+                confidence_placeholder.metric("Confidence", f"{confidence*100:.1f}%")
+                
+                # Progress bar
+                if time_held > 0:
+                    progress = min(time_held / confirmation_threshold, 1.0)
+                    progress_placeholder.progress(progress, text=f"Hold: {time_held:.1f}s / {confirmation_threshold}s")
                 else:
-                    st.info("👋 No hand detected - Show a hand sign!")
-
-            # Show top 3 predictions
-            if top3_predictions:
-                with top3_placeholder.container():
-                    st.markdown("**Top 3 Predictions:**")
-                    for i, (label, conf) in enumerate(top3_predictions, 1):
-                        st.write(f"{i}. **{label}**: {conf*100:.1f}%")
-
-            # Stats
-            frame_count += 1
-            elapsed_time = time.time() - start_time
-            fps = frame_count / elapsed_time if elapsed_time > 0 else 0
-
-            with stats_placeholder.container():
-                st.markdown("---")
-                col_stat1, col_stat2 = st.columns(2)
-                col_stat1.metric("FPS", f"{fps:.1f}")
-                col_stat2.metric("Frames", frame_count)
-
-            # Small delay
-            time.sleep(0.03)
-
-            # Check if stop button was pressed
-            if not st.session_state.camera_running:
-                break
-
-        # Release camera
+                    progress_placeholder.empty()
+            
+            # Display current word
+            word_display = st.session_state.current_word if st.session_state.current_word else "[empty]"
+            word_placeholder.markdown(
+                f'<div class="word-display">{word_display}</div>',
+                unsafe_allow_html=True
+            )
+            
+            # Display historys
+            if st.session_state.word_history:
+                history_text = "\n".join([f"{i+1}. {word}" for i, word in enumerate(st.session_state.word_history[-5:])])
+                history_placeholder.markdown(f"**Last 5 Words:**\n\n```\n{history_text}\n```")
+            
+            time.sleep(0.03)  # ~30 FPS
+        
         cap.release()
-        hands.close()
-        status_placeholder.info("📷 Camera stopped")
+        st.info("Camera stopped")
+    
+else:
+    st.error("❌ Failed to load model. Please check the file paths at the top of the script.")
+    st.info("**Current paths:**")
+    st.code(f"Model: {MODEL_PATH}\nClasses: {CLASSES_PATH}", language="text")
+    st.warning("⚠️ Update the MODEL_PATH and CLASSES_PATH variables at the top of the script with your correct file paths.")
 
-
-if __name__ == "__main__":
-    main()
+# Footer
+st.divider()
+st.markdown("""
+<div style="text-align: center; color: gray;">
+    <p>ASL Word Builder | Built with Streamlit 🎈 | Powered by MediaPipe & TensorFlow</p>
+</div>
+""", unsafe_allow_html=True)
