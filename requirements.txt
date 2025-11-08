@@ -1,14 +1,3 @@
-<<<<<<< HEAD
-numpy
-pandas
-opencv-python
-mediapipe
-tensorflow
-scikit-learn
-matplotlib
-tqdm
-streamlit
-=======
 numpy==1.26.4
 pandas==2.2.3
 opencv-python==4.11.0.86
@@ -17,4 +6,3 @@ tensorflow==2.19.1
 tqdm==4.66.4
 scikit-learn==1.5.2
 matplotlib==3.9.2
->>>>>>> fec56b14d42744966e8d5c1f9410b7675b35d4d0
